@@ -1,90 +1,209 @@
-# -*- coding: utf-8 -*-
-#
-# Copyright 2020 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+from __future__ import division
 
-# DO NOT EDIT! This is a generated sample ("LongRunningPromise",  "speech_transcribe_async_gcs")
+import re
+import sys
 
-# To install the latest published package dependency, execute the following:
-#   pip install google-cloud-speech
-
-# sample-metadata
-#   title: Transcript Audio File using Long Running Operation (Cloud Storage) (LRO)
-#   description: Transcribe long audio file from Cloud Storage using asynchronous speech
-#     recognition
-#   usage: python3 samples/v1/speech_transcribe_async_gcs.py [--storage_uri "gs://cloud-samples-data/speech/brooklyn_bridge.raw"]
-
-# [START speech_transcribe_async_gcs]
-from google.cloud import speech_v1
-from google.cloud.speech_v1 import enums
+from google.cloud import speech
+from google.cloud.speech import enums
+from google.cloud.speech import types
+import pyaudio
+from six.moves import queue
 
 
-def sample_long_running_recognize(storage_uri):
+# Audio recording parameters
+RATE = 16000
+CHUNK = int(RATE / 1000)  # 100ms
+
+
+class MicrophoneStream(object):
+    """Opens a recording stream as a generator yielding the audio chunks."""
+    def __init__(self, rate, chunk):
+        self._rate = rate
+        self._chunk = chunk
+
+        # Create a thread-safe buffer of audio data
+        self._buff = queue.Queue()
+        self.closed = True
+
+    def __enter__(self):
+        self._audio_interface = pyaudio.PyAudio()
+        self._audio_stream = self._audio_interface.open(
+            format=pyaudio.paInt16,
+            # The API currently only supports 1-channel (mono) audio
+            # https://goo.gl/z757pE
+            channels=1, rate=self._rate,
+            input=True, frames_per_buffer=self._chunk,
+            # Run the audio stream asynchronously to fill the buffer object.
+            # This is necessary so that the input device's buffer doesn't
+            # overflow while the calling thread makes network requests, etc.
+            stream_callback=self._fill_buffer,
+        )
+
+        self.closed = False
+
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self._audio_stream.stop_stream()
+        self._audio_stream.close()
+        self.closed = True
+        # Signal the generator to terminate so that the client's
+        # streaming_recognize method will not block the process termination.
+        self._buff.put(None)
+        self._audio_interface.terminate()
+
+    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+        """Continuously collect data from the audio stream, into the buffer."""
+        self._buff.put(in_data)
+        return None, pyaudio.paContinue
+
+    def generator(self):
+        while not self.closed:
+            # Use a blocking get() to ensure there's at least one chunk of
+            # data, and stop iteration if the chunk is None, indicating the
+            # end of the audio stream.
+            chunk = self._buff.get()
+            if chunk is None:
+                return
+            data = [chunk]
+
+            # Now consume whatever other data's still buffered.
+            while True:
+                try:
+                    chunk = self._buff.get(block=False)
+                    if chunk is None:
+                        return
+                    data.append(chunk)
+                except queue.Empty:
+                    break
+
+            yield b''.join(data)
+
+
+def listen_print_loop(responses):
+    """Iterates through server responses and prints them.
+
+    The responses passed is a generator that will block until a response
+    is provided by the server.
+
+    Each response may contain multiple results, and each result may contain
+    multiple alternatives; for details, see https://goo.gl/tjCPAU.  Here we
+    print only the transcription for the top alternative of the top result.
+
+    In this case, responses are provided for interim results as well. If the
+    response is an interim one, print a line feed at the end of it, to allow
+    the next result to overwrite it, until the response is a final one. For the
+    final one, print a newline to preserve the finalized transcription.
     """
-    Transcribe long audio file from Cloud Storage using asynchronous speech
-    recognition
-    Args:
-      storage_uri URI for audio file in Cloud Storage, e.g. gs://[BUCKET]/[FILE]
-    """
+    num_chars_printed = 0
+    for response in responses:
+        if not response.results:
+            continue
 
-    client = speech_v1.SpeechClient()
+        # The `results` list is consecutive. For streaming, we only care about
+        # the first result being considered, since once it's `is_final`, it
+        # moves on to considering the next utterance.
+        result = response.results[0]
+        if not result.alternatives:
+            continue
 
-    # storage_uri = 'gs://cloud-samples-data/speech/brooklyn_bridge.raw'
+        # Display the transcription of the top alternative.
+        transcript = result.alternatives[0].transcript
 
-    # Sample rate in Hertz of the audio data sent
-    sample_rate_hertz = 16000
-
-    # The language of the supplied audio
-    language_code = "en-US"
-
-    # Encoding of audio data sent. This sample sets this explicitly.
-    # This field is optional for FLAC and WAV audio formats.
-    encoding = enums.RecognitionConfig.AudioEncoding.LINEAR16
-    config = {
-        "sample_rate_hertz": sample_rate_hertz,
-        "language_code": language_code,
-        "encoding": encoding,
-    }
-    audio = {"uri": storage_uri}
-
-    operation = client.long_running_recognize(config, audio)
-
-    print(u"Waiting for operation to complete...")
-    response = operation.result()
-
-    for result in response.results:
-        # First alternative is the most probable result
-        alternative = result.alternatives[0]
-        print(u"Transcript: {}".format(alternative.transcript))
+        # Display interim results, but with a carriage return at the end of the
+        # line, so subsequent lines will overwrite them.
+        #
+        # If the previous result was longer than this one, we need to print
+        # some extra spaces to overwrite the previous result
+        overwrite_chars = ' ' * (num_chars_printed - len(transcript))
 
 
-# [END speech_transcribe_async_gcs]
+
+        if not result.is_final:
+            sys.stdout.write(transcript + overwrite_chars + '\r')
+            sys.stdout.flush()
+
+            num_chars_printed = len(transcript)
+
+        else:
+            print(transcript + overwrite_chars )
+ # this is where my function of analysis will go
+
+
+
+            Num_words_section = len(transcript.split())
+
+            result = response.results[0]
+            # First alternative is the most probable result
+
+            #total words
+            alternative = result.alternatives[0]
+            #since beginning
+            total_words = alternative.transcript
+
+            # total time since recording
+            total_time = result.result_end_time
+            #in seconds
+            total_time_seconds = total_time.seconds
+
+
+
+            print(Num_words_section)
+
+            print(u"Transcript: {}".format(total_words))
+
+            print(u"Transcript: {}".format(total_time_seconds))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            # Exit recognition if any of the transcribed phrases could be
+            # one of our keywords.
+            if re.search(r'\b(exit|quit)\b', transcript, re.I):
+                print('Exiting..')
+                break
+
+            num_chars_printed = 0
 
 
 def main():
-    import argparse
+    # See http://g.co/cloud/speech/docs/languages
+    # for a list of supported languages.
+    language_code = 'en-US'  # a BCP-47 language tag
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--storage_uri",
-        type=str,
-        default="gs://cloud-samples-data/speech/brooklyn_bridge.raw",
-    )
-    args = parser.parse_args()
+    client = speech.SpeechClient()
+    config = types.RecognitionConfig(
+        encoding=enums.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=RATE,
+        language_code=language_code)
+    streaming_config = types.StreamingRecognitionConfig(
+        config=config,
+        interim_results=True)
 
-    sample_long_running_recognize(args.storage_uri)
+    with MicrophoneStream(RATE, CHUNK) as stream:
+        audio_generator = stream.generator()
+        requests = (types.StreamingRecognizeRequest(audio_content=content)
+                    for content in audio_generator)
+
+        responses = client.streaming_recognize(streaming_config, requests)
+
+        # Now, put the transcription responses to use.
+        listen_print_loop(responses)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    try:
+        main()
+
+    except:
+        print("")
